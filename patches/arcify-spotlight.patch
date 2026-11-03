@@ -1,0 +1,858 @@
+diff --git a/background.js b/background.js
+index 80c9f1d..3ee05b6 100644
+--- a/background.js
++++ b/background.js
+@@ -9,6 +9,9 @@
+ import { SearchEngine } from './shared/search-engine.js';
+ import { BackgroundDataProvider } from './shared/data-providers/background-data-provider.js';
+ import { Logger } from './logger.js';
++import { isBrowserNewTabUrl } from './shared/new-tab-urls.js';
++import { completionTarget, pickSiteCompletion, HISTORY_WINDOW_MS } from './shared/site-completion.js';
++import { getAllDomains } from './shared/popular-sites.js';
+ import { getSettings } from './utils.js';
+ import { arcifyProvider } from './shared/data-providers/arcify-provider.js';
+ import { BookmarkUtils } from './bookmark-utils.js';
+@@ -67,20 +70,52 @@ const backgroundSearchEngine = new SearchEngine(backgroundDataProvider);
+ const spotlightOpenTabs = new Set();
+ 
+ // Close spotlight in tracked tabs only
+-async function closeSpotlightInTrackedTabs() {
++async function closeSpotlightInTrackedTabs(exceptTabId = null) {
+     try {
+-        const closePromises = Array.from(spotlightOpenTabs).map(tabId =>
++        const closePromises = Array.from(spotlightOpenTabs).filter(tabId => tabId !== exceptTabId).map(tabId =>
+             chrome.tabs.sendMessage(tabId, { action: 'closeSpotlight' }).catch(() => {
+                 spotlightOpenTabs.delete(tabId);
+             })
+         );
+         await Promise.all(closePromises);
+-        spotlightOpenTabs.clear();
++        for (const tabId of Array.from(spotlightOpenTabs)) {
++            if (tabId !== exceptTabId) spotlightOpenTabs.delete(tabId);
++        }
+     } catch (error) {
+         Logger.error('[Background] Error closing spotlight in tracked tabs:', error);
+     }
+ }
+ 
++// --- Arc-style cancel: a second Cmd+T (or Escape) closes the Spotlight page ---
++const SPOTLIGHT_RETURN_KEY = 'spotlightReturnTabs'; // { [spotlightTabId]: previousTabId }
++
++function isSpotlightPage(tab) {
++    const url = tab?.pendingUrl || tab?.url || '';
++    return url.startsWith(chrome.runtime.getURL('newtab.html')) || isBrowserNewTabUrl(url);
++}
++
++async function rememberReturnTab(spotlightTabId, previousTabId) {
++    try {
++        const { [SPOTLIGHT_RETURN_KEY]: map = {} } = await chrome.storage.session.get(SPOTLIGHT_RETURN_KEY);
++        map[spotlightTabId] = previousTabId;
++        await chrome.storage.session.set({ [SPOTLIGHT_RETURN_KEY]: map });
++    } catch (_) { /* best effort */ }
++}
++
++async function cancelSpotlightPage(tab) {
++    let previousTabId = null;
++    try {
++        const { [SPOTLIGHT_RETURN_KEY]: map = {} } = await chrome.storage.session.get(SPOTLIGHT_RETURN_KEY);
++        previousTabId = map[tab.id] ?? null;
++        delete map[tab.id];
++        await chrome.storage.session.set({ [SPOTLIGHT_RETURN_KEY]: map });
++    } catch (_) { /* best effort */ }
++    if (previousTabId !== null) {
++        try { await chrome.tabs.update(previousTabId, { active: true }); } catch (_) { /* tab gone */ }
++    }
++    await chrome.tabs.remove(tab.id);
++}
++
+ // Helper function to check if a URL supports content script injection
+ function supportsContentScripts(url) {
+     if (!url) return false;
+@@ -126,15 +161,22 @@ async function injectSpotlightScript(spotlightTabMode) {
+             return;
+         }
+ 
+-        // First, close any existing spotlights in tracked tabs
+-        await closeSpotlightInTrackedTabs();
+-
+         // Get the active tab
+         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
++
++        // Second Cmd+T while the Spotlight page is showing: cancel it, like Arc
++        if (tab && isSpotlightPage(tab)) {
++            await cancelSpotlightPage(tab);
++            return;
++        }
++
++        // Close spotlights in other tabs; the active tab's overlay toggles itself
++        await closeSpotlightInTrackedTabs(tab?.id ?? null);
++
+         if (tab) {
+             if (!supportsContentScripts(tab.url)) {
+                 Logger.log("Tab URL doesn't support content scripts, opening custom new tab directly:", tab.url);
+-                await fallbackToChromeTabs(spotlightTabMode);
++                await fallbackToChromeTabs(spotlightTabMode, tab);
+                 return;
+             }
+ 
+@@ -153,7 +195,7 @@ async function injectSpotlightScript(spotlightTabMode) {
+                 throw new Error(response?.error || 'Spotlight activation did not complete');
+             } catch (messageError) {
+                 Logger.log("Content script messaging failed, using new tab fallback:", messageError);
+-                await fallbackToChromeTabs(spotlightTabMode);
++                await fallbackToChromeTabs(spotlightTabMode, tab);
+                 return;
+             }
+         }
+@@ -164,12 +206,18 @@ async function injectSpotlightScript(spotlightTabMode) {
+ }
+ 
+ // Helper function for Chrome tab fallback when spotlight injection fails
+-async function fallbackToChromeTabs(spotlightTabMode) {
++async function fallbackToChromeTabs(spotlightTabMode, fromTab = null) {
+     try {
+         await closeSpotlightInTrackedTabs();
+ 
+         Logger.log(`Falling back to custom new tab page for mode: ${spotlightTabMode}`);
+-        await chrome.tabs.create({ url: chrome.runtime.getURL('newtab.html'), active: true });
++        const createProps = { url: chrome.runtime.getURL('newtab.html'), active: true };
++        if (fromTab) {
++            createProps.index = fromTab.index + 1;
++            createProps.openerTabId = fromTab.id;
++        }
++        const created = await chrome.tabs.create(createProps);
++        if (fromTab && created) await rememberReturnTab(created.id, fromTab.id);
+         Logger.log("Spotlight failed - opened custom new tab with spotlight interface");
+ 
+     } catch (chromeTabError) {
+@@ -216,6 +264,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+         chrome.tabs.create({ url: message.url });
+         sendResponse({ success: true });
+         return false;
++    } else if (message.action === 'cancelSpotlightPage') {
++        (async () => {
++            try {
++                if (sender.tab) await cancelSpotlightPage(sender.tab);
++                sendResponse({ success: true });
++            } catch (error) {
++                sendResponse({ success: false, error: error.message });
++            }
++        })();
++        return true;
+     } else if (message.action === 'navigateToDefaultNewTab') {
+         (async () => {
+             try {
+@@ -402,6 +460,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+             }
+         })();
+         return true;
++    } else if (message.action === 'getSiteCompletion') {
++        (async () => {
++            try {
++                const target = completionTarget(message.query || '');
++                if (!target) {
++                    sendResponse({ success: true, completion: null });
++                    return;
++                }
++                const [history, topSites] = await Promise.all([
++                    chrome.history.search({ text: target.core, startTime: Date.now() - HISTORY_WINDOW_MS, maxResults: 200 }).catch(() => []),
++                    chrome.topSites.get().catch(() => [])
++                ]);
++                const completion = pickSiteCompletion(message.query, { history, topSites, popularDomains: getAllDomains() });
++                sendResponse({ success: true, completion });
++            } catch (error) {
++                sendResponse({ success: false, error: error.message });
++            }
++        })();
++        return true;
+     } else if (message.action === 'getLocalSuggestions') {
+         (async () => {
+             try {
+diff --git a/newtab.js b/newtab.js
+index 43b019b..17650ef 100644
+--- a/newtab.js
++++ b/newtab.js
+@@ -11,6 +11,7 @@ import { SelectionManager } from './shared/selection-manager.js';
+ import { SpotlightMessageClient } from './shared/message-client.js';
+ import { SpotlightTabMode } from './shared/search-types.js';
+ import { SharedSpotlightLogic } from './shared/shared-component-logic.js';
++import { InlineCompletion } from './shared/inline-completion.js';
+ import { Logger } from './logger.js';
+ 
+ // Initialize spotlight on page load
+@@ -344,7 +345,7 @@ async function initializeSpotlight() {
+ 
+     // Handle instant suggestion update (no debouncing)
+     function handleInstantInput() {
+-        const query = input.value.trim();
++        const query = inlineCompletion.query.trim();
+ 
+         if (!query) {
+             // Clearing the input should be immediate and deterministic. Do not
+@@ -362,7 +363,7 @@ async function initializeSpotlight() {
+     // Phase 2: Autocomplete appends when ready (~200-500ms)
+     // Stale queries are discarded via query generation counter
+     async function handleAsyncSearch() {
+-        const query = input.value.trim();
++        const query = inlineCompletion.query.trim();
+         const queryId = searchQueryId;
+ 
+         if (!query) {
+@@ -429,6 +430,8 @@ async function initializeSpotlight() {
+         selectionManager.updateResults([]);
+     }
+ 
++    const inlineCompletion = new InlineCompletion(input, query => SpotlightMessageClient.getSiteCompletion(query));
++
+     // Create the base input handler once (with debouncing)
+     const baseInputHandler = SharedSpotlightLogic.createInputHandler(
+         handleInstantInput,
+@@ -446,8 +449,14 @@ async function initializeSpotlight() {
+         // Invalidate any previous local/autocomplete request immediately rather
+         // than leaving it live until the debounced callback runs.
+         searchQueryId += 1;
+-        // User typed something - trigger search
++        // User typed something - trigger search, and complete a matching site inline
++        const pendingCompletion = inlineCompletion.update(e);
+         baseInputHandler(e);
++        pendingCompletion.then(completion => {
++            if (!completion) return;
++            instantSuggestion = SpotlightUtils.generateSiteCompletionSuggestions(completion, inlineCompletion.query.trim());
++            updateDisplay();
++        });
+     });
+ 
+     // Handle result selection
+@@ -477,7 +486,7 @@ async function initializeSpotlight() {
+     input.addEventListener('keydown', SharedSpotlightLogic.createKeyDownHandler(
+         selectionManager,
+         (selected) => handleResultAction(selected),
+-        () => { } // No escape handler needed on new tab page
++        () => { chrome.runtime.sendMessage({ action: 'cancelSpotlightPage' }).catch(() => {}); } // Escape cancels, like Arc
+     ));
+ 
+     // Handle clicks on results
+diff --git a/overlay.js b/overlay.js
+index 0253b4e..a7e068c 100644
+--- a/overlay.js
++++ b/overlay.js
+@@ -18,6 +18,7 @@ import { SelectionManager } from './shared/selection-manager.js';
+ import { SpotlightMessageClient } from './shared/message-client.js';
+ import { SpotlightTabMode } from './shared/search-types.js';
+ import { SharedSpotlightLogic } from './shared/shared-component-logic.js';
++import { InlineCompletion } from './shared/inline-completion.js';
+ import { Logger } from './logger.js';
+ 
+ /**
+@@ -50,7 +51,18 @@ if (!window.arcifySpotlightTabMode) {
+             // Keep the response channel open until the dialog is actually mounted. This lets
+             // the background fallback recover from early-document or rendering failures.
+             activateSpotlight(message.mode)
+-                .then(() => sendResponse({ success: true }))
++                .then(() => {
++                    // Cmd+T pressed while another part of the window (e.g. a side panel such as
++                    // Arcify) has keyboard focus: the page can't take it, so typing would go nowhere.
++                    // Close the bar and let the background open the Spotlight page as a tab instead.
++                    const dialog = getExistingSpotlightDialog();
++                    if (dialog?.open && !document.hasFocus()) {
++                        dialog.close();
++                        sendResponse({ success: false, error: 'page-not-focused' });
++                        return;
++                    }
++                    sendResponse({ success: true });
++                })
+                 .catch(error => {
+                     Logger.error('[Spotlight] Activation failed:', error);
+                     sendResponse({ success: false, error: error.message });
+@@ -567,7 +579,7 @@ async function activateSpotlight(spotlightTabMode = 'current-tab') {
+ 
+     // Handle instant suggestion update (no debouncing)
+     function handleInstantInput() {
+-        const query = input.value.trim();
++        const query = inlineCompletion.query.trim();
+ 
+         if (!query) {
+             displayEmptyState();
+@@ -584,7 +596,7 @@ async function activateSpotlight(spotlightTabMode = 'current-tab') {
+     // Phase 2: Autocomplete appends when ready (~200-500ms)
+     // Stale queries are discarded via query generation counter
+     async function handleAsyncSearch() {
+-        const query = input.value.trim();
++        const query = inlineCompletion.query.trim();
+         const queryId = searchQueryId;
+ 
+         if (!query) {
+@@ -663,6 +675,8 @@ async function activateSpotlight(spotlightTabMode = 'current-tab') {
+     }
+ 
+ 
++    const inlineCompletion = new InlineCompletion(input, query => SpotlightMessageClient.getSiteCompletion(query));
++
+     // Create the base input handler once (with debouncing)
+     const baseInputHandler = SharedSpotlightLogic.createInputHandler(
+         handleInstantInput,    // instant update (zero latency)
+@@ -680,8 +694,14 @@ async function activateSpotlight(spotlightTabMode = 'current-tab') {
+         // Invalidate in-flight work synchronously; waiting for the debounced
+         // callback leaves a window where stale results can repaint the UI.
+         searchQueryId += 1;
+-        // User typed something - trigger search
++        // User typed something - trigger search, and complete a matching site inline
++        const pendingCompletion = inlineCompletion.update(e);
+         baseInputHandler(e);
++        pendingCompletion.then(completion => {
++            if (!completion) return;
++            instantSuggestion = SpotlightUtils.generateSiteCompletionSuggestions(completion, inlineCompletion.query.trim());
++            updateDisplay();
++        });
+     });
+ 
+     // Handle result selection
+diff --git a/shared/data-providers/background-data-provider.js b/shared/data-providers/background-data-provider.js
+index bae6c2c..3f5facd 100644
+--- a/shared/data-providers/background-data-provider.js
++++ b/shared/data-providers/background-data-provider.js
+@@ -1,5 +1,6 @@
+ // background-data-provider.js - Direct Chrome API implementation for background scripts
+ 
++import { isBrowserNewTabUrl } from '../new-tab-urls.js';
+ import { BaseDataProvider } from './base-data-provider.js';
+ import { AutocompleteProvider } from './autocomplete-provider.js';
+ import { BookmarkUtils } from '../../bookmark-utils.js';
+@@ -34,9 +35,20 @@ export class BackgroundDataProvider extends BaseDataProvider {
+             // Filter out tabs without required fields
+             const validTabs = tabs.filter(tab => tab.title && tab.url);
+ 
+-            // No query = return all valid tabs
++            // No query = return tabs by most recent use (Arc-style), without the current tab
+             if (!query) {
+-                return validTabs.map(tab => {
++                let currentTabId = null;
++                try {
++                    const focused = await chrome.windows?.getLastFocused?.();
++                    currentTabId = tabs.find(t => t.active && t.windowId === focused?.id)?.id ?? null;
++                } catch (_) { /* no focused window: keep every tab */ }
++                const ownPages = chrome.runtime?.getURL?.('') || null;
++                return validTabs
++                    .filter(tab => tab.id !== currentTabId
++                        && !(ownPages && tab.url.startsWith(ownPages))
++                        && !isBrowserNewTabUrl(tab.url))
++                    .sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0))
++                    .map(tab => {
+                     const group = tab.groupId !== -1 ? groupMap.get(tab.groupId) : null;
+                     if (group) {
+                         tab.groupName = group.title || '';
+diff --git a/shared/inline-completion.js b/shared/inline-completion.js
+new file mode 100644
+index 0000000..824ab7b
+--- /dev/null
++++ b/shared/inline-completion.js
+@@ -0,0 +1,41 @@
++import { completeInput } from './site-completion.js';
++
++export class InlineCompletion {
++    constructor(input, fetchCompletion) {
++        this.input = input;
++        this.fetchCompletion = fetchCompletion;
++        this.typed = input.value;
++        this.completion = null;
++        this.requestId = 0;
++    }
++
++    get query() {
++        return this.typed;
++    }
++
++    async update(event) {
++        const input = this.input;
++        this.typed = input.value;
++        this.completion = null;
++        const requestId = ++this.requestId;
++
++        const deleting = typeof event?.inputType === 'string' && event.inputType.startsWith('delete');
++        const caretAtEnd = input.selectionStart === input.value.length && input.selectionEnd === input.value.length;
++        if (deleting || !caretAtEnd || !this.typed) return null;
++
++        let completion = null;
++        try {
++            completion = await this.fetchCompletion(this.typed);
++        } catch {
++            completion = null;
++        }
++        if (requestId !== this.requestId || input.value !== this.typed || !completion) return null;
++
++        const text = completeInput(this.typed, completion.host);
++        if (!text) return null;
++        input.value = text;
++        input.setSelectionRange(this.typed.length, text.length);
++        this.completion = completion;
++        return completion;
++    }
++}
+diff --git a/shared/message-client.js b/shared/message-client.js
+index db08eca..7fdd46f 100644
+--- a/shared/message-client.js
++++ b/shared/message-client.js
+@@ -28,6 +28,16 @@ export class SpotlightMessageClient {
+     }
+ 
+     // Get local suggestions only (fast, no autocomplete) - PERF-03 progressive rendering Phase 1
++    static async getSiteCompletion(query) {
++        try {
++            const response = await chrome.runtime.sendMessage({ action: 'getSiteCompletion', query });
++            return response && response.success ? response.completion : null;
++        } catch (error) {
++            Logger.error('[SpotlightMessageClient] Get site completion error:', error);
++            return null;
++        }
++    }
++
+     static async getLocalSuggestions(query, mode) {
+         try {
+             const response = await chrome.runtime.sendMessage({
+diff --git a/shared/new-tab-urls.js b/shared/new-tab-urls.js
+new file mode 100644
+index 0000000..63be479
+--- /dev/null
++++ b/shared/new-tab-urls.js
+@@ -0,0 +1,6 @@
++// The browser's own new-tab page in Chrome and other Chromium browsers.
++const NEW_TAB_URL = /^(chrome|edge|brave|vivaldi|opera):\/\/(newtab|new-tab-page|startpage)\/?$|^chrome-search:\/\/local-ntp\//;
++
++export function isBrowserNewTabUrl(url) {
++    return typeof url === 'string' && NEW_TAB_URL.test(url);
++}
+diff --git a/shared/shared-component-logic.js b/shared/shared-component-logic.js
+index 5eba6fa..3d805e9 100644
+--- a/shared/shared-component-logic.js
++++ b/shared/shared-component-logic.js
+@@ -25,15 +25,18 @@ export class SharedSpotlightLogic {
+      */
+     static combineResults(instantSuggestion, asyncSuggestions) {
+         const combined = [];
++        const instants = (Array.isArray(instantSuggestion) ? instantSuggestion : [instantSuggestion]).filter(Boolean);
+ 
+-        // Add instant suggestion first (if exists)
+-        if (instantSuggestion) {
+-            combined.push(instantSuggestion);
++        // Add instant suggestions first (if any)
++        for (const instant of instants) {
++            if (!combined.some(existing => SpotlightUtils.areResultsDuplicate(existing, instant))) {
++                combined.push(instant);
++            }
+         }
+ 
+-        // Add async suggestions, filtering out duplicates of the instant suggestion
++        // Add async suggestions, filtering out duplicates of the instant suggestions
+         for (const asyncResult of asyncSuggestions) {
+-            const isDuplicate = instantSuggestion && SpotlightUtils.areResultsDuplicate(instantSuggestion, asyncResult);
++            const isDuplicate = instants.some(instant => SpotlightUtils.areResultsDuplicate(instant, asyncResult));
+             if (!isDuplicate) {
+                 combined.push(asyncResult);
+             }
+diff --git a/shared/site-completion.js b/shared/site-completion.js
+new file mode 100644
+index 0000000..500e8f4
+--- /dev/null
++++ b/shared/site-completion.js
+@@ -0,0 +1,73 @@
++const SCHEME = /^https?:\/\//;
++const DAY_MS = 24 * 60 * 60 * 1000;
++export const HISTORY_WINDOW_MS = 90 * DAY_MS;
++
++export function hostOf(url) {
++    try {
++        return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
++    } catch {
++        return null;
++    }
++}
++
++function originOf(url) {
++    try {
++        const { protocol, origin } = new URL(url);
++        return protocol === 'http:' || protocol === 'https:' ? origin : null;
++    } catch {
++        return null;
++    }
++}
++
++export function completionTarget(query) {
++    if (typeof query !== 'string' || !query || query !== query.trim() || /\s/.test(query)) return null;
++    const lower = query.toLowerCase();
++    const scheme = (lower.match(SCHEME) || [''])[0];
++    let rest = lower.slice(scheme.length);
++    const www = rest.startsWith('www.') ? 'www.' : '';
++    rest = rest.slice(www.length);
++    if (!rest || rest.includes('/') || rest.includes(':')) return null;
++    return { prefix: scheme + www, core: rest };
++}
++
++export function pickSiteCompletion(query, { history = [], topSites = [], popularDomains = [] } = {}) {
++    const target = completionTarget(query);
++    if (!target) return null;
++
++    const candidates = new Map();
++    const add = (host, points, origin = null) => {
++        if (!host || host === target.core || !host.startsWith(target.core)) return;
++        const entry = candidates.get(host) || { host, points: 0, origin: null };
++        entry.points += points;
++        entry.origin = entry.origin || origin;
++        candidates.set(host, entry);
++    };
++
++    for (const item of history) {
++        add(hostOf(item.url), (item.typedCount || 0) * 10 + (item.visitCount || 0), originOf(item.url));
++    }
++    for (const site of topSites) {
++        add(hostOf(site.url), 50, originOf(site.url));
++    }
++    for (const domain of popularDomains) {
++        add(String(domain).toLowerCase().replace(/^www\./, ''), 1);
++    }
++
++    let best = null;
++    for (const entry of candidates.values()) {
++        if (!best
++            || entry.points > best.points
++            || (entry.points === best.points && entry.host.length < best.host.length)
++            || (entry.points === best.points && entry.host.length === best.host.length && entry.host < best.host)) {
++            best = entry;
++        }
++    }
++    if (!best) return null;
++    return { host: best.host, url: best.origin || `https://${best.host}` };
++}
++
++export function completeInput(typed, host) {
++    const target = completionTarget(typed);
++    if (!target || !host || !host.startsWith(target.core) || host === target.core) return null;
++    return typed + host.slice(target.core.length);
++}
+diff --git a/shared/ui-utilities.js b/shared/ui-utilities.js
+index 52e83a0..28304e5 100644
+--- a/shared/ui-utilities.js
++++ b/shared/ui-utilities.js
+@@ -129,6 +129,16 @@ export class SpotlightUtils {
+         }
+     }
+ 
++    // Rows for an inline site completion: the site first, then the plain suggestion for the typed text
++    static generateSiteCompletionSuggestions(completion, typed) {
++        const site = SpotlightUtils.generateInstantSuggestion(completion.host);
++        if (site) {
++            site.url = completion.url;
++            site.metadata = { ...site.metadata, originalInput: typed };
++        }
++        return [site, SpotlightUtils.generateInstantSuggestion(typed)].filter(Boolean);
++    }
++
+     // Escape HTML utility (consolidated from overlay.js and popup.js)
+     static escapeHtml(text) {
+         const div = document.createElement('div');
+diff --git a/test/unit/arc-cmd-t.test.js b/test/unit/arc-cmd-t.test.js
+new file mode 100644
+index 0000000..df35667
+--- /dev/null
++++ b/test/unit/arc-cmd-t.test.js
+@@ -0,0 +1,118 @@
++import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
++import { chromeMock } from '../mocks/chrome.js';
++
++vi.mock('../../logger.js', () => ({
++    Logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn(), initialize: vi.fn() }
++}));
++vi.mock('../../utils.js', () => ({ getSettings: vi.fn().mockResolvedValue({ enableSpotlight: true }) }));
++vi.mock('../../bookmark-utils.js', () => ({ BookmarkUtils: { invalidateBookmarkCache: vi.fn() } }));
++vi.mock('../../shared/data-providers/arcify-provider.js', () => ({ arcifyProvider: { invalidateCache: vi.fn() } }));
++
++const NEWTAB = 'chrome-extension://mock-id/newtab.html';
++let sessionStore = {};
++let onCommand;
++let onMessageListeners;
++
++function installSessionStorage() {
++    chromeMock.storage.session = {
++        get: vi.fn(async key => (key in sessionStore ? { [key]: structuredClone(sessionStore[key]) } : {})),
++        set: vi.fn(async obj => { Object.assign(sessionStore, structuredClone(obj)); })
++    };
++}
++
++beforeAll(async () => {
++    installSessionStorage();
++    await import('../../background.js');
++    onCommand = chromeMock.commands.onCommand.addListener.mock.calls.at(-1)[0];
++    onMessageListeners = chromeMock.runtime.onMessage.addListener.mock.calls.map(c => c[0]);
++});
++
++beforeEach(() => {
++    sessionStore = {};
++    installSessionStorage();
++    chromeMock.tabs.remove = vi.fn().mockResolvedValue(undefined);
++});
++
++const activeTab = tab => chromeMock.tabs.query.mockResolvedValue([tab]);
++
++describe('Arc-style Cmd+T bound to the Spotlight "New Tab" command', () => {
++    it('on a page without content scripts, opens the Spotlight page next to it', async () => {
++        activeTab({ id: 7, index: 3, url: 'chrome://extensions/' });
++        chromeMock.tabs.create.mockResolvedValue({ id: 50 });
++        await onCommand('toggleSpotlightNewTab');
++        expect(chromeMock.tabs.create).toHaveBeenCalledWith(
++            expect.objectContaining({ url: NEWTAB, active: true, index: 4, openerTabId: 7 }));
++        expect(sessionStore.spotlightReturnTabs).toEqual({ 50: 7 });
++    });
++
++    it('a second Cmd+T on the Spotlight page closes it and returns to the previous tab', async () => {
++        sessionStore.spotlightReturnTabs = { 50: 7 };
++        activeTab({ id: 50, index: 4, url: NEWTAB });
++        await onCommand('toggleSpotlightNewTab');
++        expect(chromeMock.tabs.update).toHaveBeenCalledWith(7, { active: true });
++        expect(chromeMock.tabs.remove).toHaveBeenCalledWith(50);
++        expect(chromeMock.tabs.create).not.toHaveBeenCalled();
++        expect(sessionStore.spotlightReturnTabs).toEqual({});
++    });
++
++    it('treats a fresh chrome://newtab tab as the Spotlight page too', async () => {
++        activeTab({ id: 9, index: 1, url: 'chrome://newtab/' });
++        await onCommand('toggleSpotlightNewTab');
++        expect(chromeMock.tabs.remove).toHaveBeenCalledWith(9);
++        expect(chromeMock.tabs.create).not.toHaveBeenCalled();
++    });
++
++    it.each(['edge://newtab/', 'brave://newtab/', 'vivaldi://startpage/', 'opera://startpage/'])(
++        'treats the new-tab page of other Chromium browsers (%s) the same way', async url => {
++            activeTab({ id: 11, index: 1, url });
++            await onCommand('toggleSpotlightNewTab');
++            expect(chromeMock.tabs.remove).toHaveBeenCalledWith(11);
++            expect(chromeMock.tabs.create).not.toHaveBeenCalled();
++        });
++
++    it('on a normal page, asks the overlay to toggle and does not close it first', async () => {
++        // the overlay is open in tab 3 and reported itself
++        const opened = onMessageListeners.map(l => l({ action: 'spotlightOpened' }, { tab: { id: 3 } }, () => {}));
++        activeTab({ id: 3, index: 0, url: 'https://example.com/' });
++        chromeMock.tabs.sendMessage.mockResolvedValue({ success: true });
++        await onCommand('toggleSpotlightNewTab');
++        const actions = chromeMock.tabs.sendMessage.mock.calls.filter(c => c[0] === 3).map(c => c[1].action);
++        expect(actions).toEqual(['activateSpotlight']);
++        expect(chromeMock.tabs.create).not.toHaveBeenCalled();
++    });
++
++    it('if the page cannot take keyboard focus (e.g. a side panel has it), opens the Spotlight page instead', async () => {
++        activeTab({ id: 3, index: 2, url: 'https://example.com/' });
++        chromeMock.tabs.sendMessage.mockResolvedValue({ success: false, error: 'page-not-focused' });
++        chromeMock.tabs.create.mockResolvedValue({ id: 60 });
++        await onCommand('toggleSpotlightNewTab');
++        expect(chromeMock.tabs.create).toHaveBeenCalledWith(
++            expect.objectContaining({ url: NEWTAB, active: true, index: 3, openerTabId: 3 }));
++        expect(sessionStore.spotlightReturnTabs).toEqual({ 60: 3 });
++    });
++
++    it('answers site completion requests from history, top sites and popular sites', async () => {
++        chromeMock.history = { search: vi.fn().mockResolvedValue([
++            { url: 'https://www.youtube.com/watch?v=1', visitCount: 4, typedCount: 1 }
++        ]) };
++        chromeMock.topSites.get.mockResolvedValue([]);
++        const responses = [];
++        const done = new Promise(resolve => {
++            for (const l of onMessageListeners) {
++                const keepOpen = l({ action: 'getSiteCompletion', query: 'you' }, {}, r => { responses.push(r); resolve(); });
++                if (keepOpen === true) break;
++            }
++        });
++        await done;
++        expect(chromeMock.history.search).toHaveBeenCalledWith(expect.objectContaining({ text: 'you' }));
++        expect(responses[0]).toEqual({ success: true, completion: { host: 'youtube.com', url: 'https://www.youtube.com' } });
++    });
++
++    it('Escape on the Spotlight page cancels it', async () => {
++        sessionStore.spotlightReturnTabs = { 50: 7 };
++        const responses = [];
++        for (const l of onMessageListeners) l({ action: 'cancelSpotlightPage' }, { tab: { id: 50, url: NEWTAB } }, r => responses.push(r));
++        await vi.waitFor(() => expect(chromeMock.tabs.remove).toHaveBeenCalledWith(50));
++        expect(chromeMock.tabs.update).toHaveBeenCalledWith(7, { active: true });
++    });
++});
+diff --git a/test/unit/recent-tabs-order.test.js b/test/unit/recent-tabs-order.test.js
+new file mode 100644
+index 0000000..51a9bf4
+--- /dev/null
++++ b/test/unit/recent-tabs-order.test.js
+@@ -0,0 +1,57 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
++import { chromeMock } from '../mocks/chrome.js';
++
++vi.mock('../../logger.js', () => ({
++    Logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn(), initialize: vi.fn() }
++}));
++
++import { BackgroundDataProvider } from '../../shared/data-providers/background-data-provider.js';
++
++const EXT = 'chrome-extension://abc/';
++
++describe('empty query lists tabs by most recent use (Arc-style)', () => {
++    let provider;
++    const originalGetURL = chromeMock.runtime.getURL;
++    beforeEach(() => {
++        provider = new BackgroundDataProvider();
++        chromeMock.windows.getLastFocused = vi.fn().mockResolvedValue({ id: 1 });
++        chromeMock.runtime.getURL = vi.fn(path => EXT + path);
++        chromeMock.tabGroups.query.mockResolvedValue([]);
++        chromeMock.tabs.query.mockResolvedValue([
++            { id: 1, title: 'Pinned mail', url: 'https://mail.test', pinned: true, groupId: -1, windowId: 1, lastAccessed: 100 },
++            { id: 2, title: 'Docs', url: 'https://docs.test', groupId: -1, windowId: 1, lastAccessed: 300 },
++            { id: 3, title: 'Current page', url: 'https://current.test', active: true, groupId: -1, windowId: 1, lastAccessed: 999 },
++            { id: 4, title: 'Other window', url: 'https://other.test', active: true, groupId: -1, windowId: 2, lastAccessed: 500 },
++            { id: 5, title: 'Spotlight new tab', url: EXT + 'newtab.html', groupId: -1, windowId: 1, lastAccessed: 800 },
++            { id: 6, title: 'Never focused', url: 'https://never.test', groupId: -1, windowId: 1 },
++            { id: 7, title: 'Edge new tab', url: 'edge://newtab/', groupId: -1, windowId: 1, lastAccessed: 900 }
++        ]);
++    });
++    afterEach(() => {
++        delete chromeMock.windows.getLastFocused;
++        chromeMock.runtime.getURL = originalGetURL;
++    });
++
++    it('orders by lastAccessed, newest first, pinned tabs get no priority', async () => {
++        const ids = (await provider.getOpenTabsData()).map(t => t.id);
++        expect(ids).toEqual([4, 2, 1, 6]);
++    });
++
++    it('leaves out the current tab and the extension own pages', async () => {
++        const ids = (await provider.getOpenTabsData()).map(t => t.id);
++        expect(ids).not.toContain(3);
++        expect(ids).not.toContain(5);
++        expect(ids).not.toContain(7);
++    });
++
++    it('typed queries are unaffected (fuzzy search still finds the current tab)', async () => {
++        const titles = (await provider.getOpenTabsData('current')).map(t => t.title);
++        expect(titles).toContain('Current page');
++    });
++
++    it('keeps every tab if the focused window cannot be determined', async () => {
++        chromeMock.windows.getLastFocused = vi.fn().mockRejectedValue(new Error('no window'));
++        const ids = (await provider.getOpenTabsData()).map(t => t.id);
++        expect(ids).toContain(3);
++    });
++});
+diff --git a/test/unit/site-completion.test.js b/test/unit/site-completion.test.js
+new file mode 100644
+index 0000000..c671495
+--- /dev/null
++++ b/test/unit/site-completion.test.js
+@@ -0,0 +1,114 @@
++import { describe, it, expect, vi } from 'vitest';
++import { pickSiteCompletion, completeInput, completionTarget, hostOf } from '../../shared/site-completion.js';
++import { InlineCompletion } from '../../shared/inline-completion.js';
++import { SharedSpotlightLogic } from '../../shared/shared-component-logic.js';
++import { SpotlightUtils } from '../../shared/ui-utilities.js';
++
++vi.mock('../../logger.js', () => ({
++    Logger: { log: vi.fn(), warn: vi.fn(), error: vi.fn(), info: vi.fn(), debug: vi.fn(), initialize: vi.fn() }
++}));
++
++describe('pickSiteCompletion', () => {
++    it('prefers the site whose address starts with the query and is visited most', () => {
++        const history = [
++            { url: 'https://www.youtube.com/watch?v=1', title: 'A video - YouTube', visitCount: 3, typedCount: 0 },
++            { url: 'https://www.youtube.com/watch?v=2', title: 'Another - YouTube', visitCount: 2, typedCount: 1 },
++            { url: 'https://you.com/search?q=x', title: 'you.com', visitCount: 1, typedCount: 0 },
++            { url: 'https://example.com/youtube-tips', title: 'YouTube tips', visitCount: 50, typedCount: 5 }
++        ];
++        expect(pickSiteCompletion('you', { history })).toEqual({ host: 'youtube.com', url: 'https://www.youtube.com' });
++    });
++
++    it('uses top sites, then the popular-sites list as a fallback', () => {
++        expect(pickSiteCompletion('gi', { topSites: [{ url: 'https://gitlab.com/' }], popularDomains: ['github.com'] }).host).toBe('gitlab.com');
++        expect(pickSiteCompletion('gi', { popularDomains: ['github.com', 'gizmodo.com'] }).host).toBe('github.com');
++        expect(pickSiteCompletion('gi', { popularDomains: ['github.com'] }).url).toBe('https://github.com');
++    });
++
++    it('offers nothing for searches, paths, exact hosts or unknown prefixes', () => {
++        const opts = { popularDomains: ['youtube.com'] };
++        expect(pickSiteCompletion('you tube', opts)).toBeNull();
++        expect(pickSiteCompletion('youtube.com/feed', opts)).toBeNull();
++        expect(pickSiteCompletion('youtube.com', opts)).toBeNull();
++        expect(pickSiteCompletion('zzz', opts)).toBeNull();
++        expect(pickSiteCompletion('', opts)).toBeNull();
++    });
++
++    it('accepts a typed scheme or www. and completes after it, keeping what was typed', () => {
++        expect(completionTarget('https://www.You')).toEqual({ prefix: 'https://www.', core: 'you' });
++        expect(completeInput('You', 'youtube.com')).toBe('Youtube.com');
++        expect(completeInput('www.you', 'youtube.com')).toBe('www.youtube.com');
++        expect(completeInput('https://you', 'youtube.com')).toBe('https://youtube.com');
++        expect(completeInput('yot', 'youtube.com')).toBeNull();
++        expect(hostOf('https://www.YouTube.com/x')).toBe('youtube.com');
++        expect(hostOf('not a url')).toBeNull();
++    });
++});
++
++function fakeInput(value = '') {
++    return {
++        value,
++        selectionStart: value.length,
++        selectionEnd: value.length,
++        setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
++    };
++}
++
++describe('InlineCompletion', () => {
++    const fetchYouTube = async () => ({ host: 'youtube.com', url: 'https://www.youtube.com' });
++
++    it('completes what was typed and selects the added part', async () => {
++        const input = fakeInput('you');
++        const inline = new InlineCompletion(input, fetchYouTube);
++        const completion = await inline.update({ inputType: 'insertText' });
++        expect(completion.host).toBe('youtube.com');
++        expect(input.value).toBe('youtube.com');
++        expect([input.selectionStart, input.selectionEnd]).toEqual([3, 11]);
++        expect(inline.query).toBe('you');
++    });
++
++    it('does not complete while deleting', async () => {
++        const input = fakeInput('you');
++        const inline = new InlineCompletion(input, fetchYouTube);
++        expect(await inline.update({ inputType: 'deleteContentBackward' })).toBeNull();
++        expect(input.value).toBe('you');
++    });
++
++    it('drops a completion that arrives after the user kept typing', async () => {
++        const input = fakeInput('you');
++        let release;
++        const inline = new InlineCompletion(input, () => new Promise(r => { release = r; }));
++        const pending = inline.update({ inputType: 'insertText' });
++        input.value = 'yout';
++        release({ host: 'youtube.com', url: 'https://www.youtube.com' });
++        expect(await pending).toBeNull();
++        expect(input.value).toBe('yout');
++    });
++
++    it('does not complete when the caret is not at the end', async () => {
++        const input = fakeInput('you');
++        input.selectionStart = input.selectionEnd = 1;
++        const inline = new InlineCompletion(input, fetchYouTube);
++        expect(await inline.update({ inputType: 'insertText' })).toBeNull();
++    });
++});
++
++describe('result rows for a completed site', () => {
++    it('puts the site first and the search for the typed text second, then other results', () => {
++        const rows = SpotlightUtils.generateSiteCompletionSuggestions({ host: 'youtube.com', url: 'https://www.youtube.com' }, 'you');
++        expect(rows.map(r => r.type)).toEqual(['url-suggestion', 'search-query']);
++        expect(rows[0].url).toBe('https://www.youtube.com');
++        const combined = SharedSpotlightLogic.combineResults(rows, [
++            { type: 'history', url: 'https://www.youtube.com/', title: 'YouTube' },
++            { type: 'history', url: 'https://www.youtube.com/watch?v=1', title: 'A video' }
++        ]);
++        expect(combined.map(r => r.url || r.title)).toEqual([
++            'https://www.youtube.com', 'Search for "you"', 'https://www.youtube.com/watch?v=1'
++        ]);
++    });
++
++    it('still accepts a single instant suggestion', () => {
++        const one = SpotlightUtils.generateInstantSuggestion('hello world');
++        expect(SharedSpotlightLogic.combineResults(one, [])).toEqual([one]);
++    });
++});

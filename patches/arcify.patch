@@ -1,0 +1,1144 @@
+diff --git a/domManager.js b/domManager.js
+index 381aa04..0cb1cff 100644
+--- a/domManager.js
++++ b/domManager.js
+@@ -16,6 +16,7 @@ import { firstUnusedColor } from './space-colors.js';
+ import { Utils } from './utils.js';
+ import { RESTORE_ICON } from './icons.js';
+ import { Logger } from './logger.js';
++import { applySpaceTheme } from './space-appearance.js';
+ 
+ // DOM Elements
+ const spacesList = document.getElementById('spacesList');
+@@ -177,6 +178,7 @@ export function activateSpaceInDOM(spaceId, spaces, updateSpaceSwitcher) {
+         const sidebarContainer = document.getElementById('sidebar-container');
+         sidebarContainer.style.setProperty('--space-bg-color', `var(--chrome-${space.color}-color, rgba(255, 255, 255, 0.1))`);
+         sidebarContainer.style.setProperty('--space-bg-color-dark', `var(--chrome-${space.color}-color-dark, rgba(255, 255, 255, 0.1))`);
++        applySpaceTheme(space);
+     }
+ 
+     // Update space switcher
+@@ -219,6 +221,16 @@ export function showTabContextMenu(x, y, tab, isPinned, isBookmarkOnly, tabEleme
+         });
+         contextMenu.appendChild(pinInSpaceOption);
+ 
++        const renameOption = document.createElement('div');
++        renameOption.className = 'context-menu-item';
++        renameOption.textContent = 'Rename Tab';
++        renameOption.addEventListener('click', () => {
++            contextMenu.remove();
++            const details = tabElement.querySelector('.tab-details');
++            setTimeout(() => details?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })), 0);
++        });
++        contextMenu.appendChild(renameOption);
++
+         // Arc-like: allow updating the underlying space bookmark URL to the current tab URL.
+         if (isPinned && typeof onReplaceBookmarkUrlWithCurrent === 'function') {
+             const replaceBookmarkUrlOption = document.createElement('div');
+diff --git a/sidebar.html b/sidebar.html
+index 0cf7c26..aaecb38 100644
+--- a/sidebar.html
++++ b/sidebar.html
+@@ -125,6 +125,7 @@
+                             <div class="color-swatch" data-color="purple"></div>
+                             <div class="color-swatch" data-color="cyan"></div>
+                         </div>
++                        <button class="custom-color-btn">Custom Color…</button>
+                         <button class="new-folder-btn">New Folder</button>
+                         <button class="delete-space-btn">Delete Space</button>
+                         <div class="options-separator"></div>
+diff --git a/sidebar.js b/sidebar.js
+index c6eb6e6..60e81ba 100644
+--- a/sidebar.js
++++ b/sidebar.js
+@@ -50,6 +50,7 @@ import {
+ } from './domManager.js';
+ import { BookmarkUtils } from './bookmark-utils.js';
+ import { Logger } from './logger.js';
++import { initSpaceThemes, applySpaceTheme, openSpaceThemeEditor, forgetSpaceTheme, handleSpaceRenamed } from './space-appearance.js';
+ import { MOUSE_BUTTON, CSS_CLASSES, TIMING } from './constants.js';
+ 
+ // DOM Elements
+@@ -255,6 +256,7 @@ function reapplySpaceColors() {
+ 
+     sidebarContainer.style.setProperty('--space-bg-color', colorValue);
+     sidebarContainer.style.setProperty('--space-bg-color-dark', colorDarkValue);
++    applySpaceTheme(activeSpace);
+ }
+ 
+ // Function to update pinned favicons
+@@ -543,6 +545,7 @@ async function activatePinnedTabByURL(bookmarkUrl, targetSpaceId, spaceName, boo
+ document.addEventListener('DOMContentLoaded', async () => {
+     Logger.log('DOM loaded, initializing sidebar...');
+     await applyColorOverrides();
++    await initSpaceThemes(() => reapplySpaceColors());
+ 
+     // Listen for storage changes to re-apply colors when they're updated
+     chrome.storage.onChanged.addListener((changes, areaName) => {
+@@ -840,6 +843,7 @@ function createSpaceElement(space) {
+ 
+     sidebarContainer.style.setProperty('--space-bg-color', colorValue);
+     sidebarContainer.style.setProperty('--space-bg-color-dark', colorDarkValue);
++    if (space.id === activeSpaceId) applySpaceTheme(space);
+ 
+     // Set up color select
+     const colorSelect = spaceElement.getElementById('spaceColorSelect');
+@@ -853,11 +857,29 @@ function createSpaceElement(space) {
+         // Update space background color
+         sidebarContainer.style.setProperty('--space-bg-color', `var(--chrome-${newColor}-color, rgba(255, 255, 255, 0.1))`);
+         sidebarContainer.style.setProperty('--space-bg-color-dark', `var(--chrome-${space.color}-color-dark, rgba(255, 255, 255, 0.1))`);
++        await forgetSpaceTheme(space.name);
++        applySpaceTheme(space);
+ 
+         saveSpaces();
+         await updateSpaceSwitcher();
+     });
+ 
++    // Custom color: Arc/Zen-style editor (any color, gradient, light/dark/auto, intensity, grain)
++    const customColorBtn = spaceElement.querySelector('.custom-color-btn');
++    customColorBtn?.addEventListener('click', () => {
++        customColorBtn.blur();
++        openSpaceThemeEditor(space, async namedColor => {
++            // keep the named color (tab groups, swatch grid) close to the custom one
++            space.color = namedColor;
++            colorSelect.value = namedColor;
++            spaceOptionColorSwatch.querySelectorAll('.color-swatch').forEach(swatch => {
++                swatch.classList.toggle('selected', swatch.dataset.color === namedColor);
++            });
++            await saveSpaces();
++            await updateSpaceSwitcher();
++        });
++    });
++
+     // Handle color swatch clicks
+     const spaceOptionColorSwatch = spaceElement.getElementById('spaceOptionColorSwatch');
+     spaceOptionColorSwatch.addEventListener('click', (e) => {
+@@ -894,7 +916,9 @@ function createSpaceElement(space) {
+                 const oldFolder = await getSpaceBookmarkFolder(space);
+                 await chrome.bookmarks.update(oldFolder.id, { title: nameInput.value });
+                 await LocalStorage.updateSpaceRegistryEntry(oldFolder.id, { name: nameInput.value });
++                const previousName = space.name;
+                 space.name = nameInput.value;
++                await handleSpaceRenamed(previousName, space.name);
+                 await saveSpaces();
+                 await updateSpaceSwitcher();
+             });
+@@ -986,6 +1010,7 @@ function createSpaceElement(space) {
+         if (confirm(message)) {
+             try {
+                 await deleteSpace(space.id);
++                await forgetSpaceTheme(space.name);
+             } catch (error) {
+                 alert(error.message);
+             }
+diff --git a/space-appearance.js b/space-appearance.js
+new file mode 100644
+index 0000000..a833489
+--- /dev/null
++++ b/space-appearance.js
+@@ -0,0 +1,263 @@
++/**
++ * Paints the sidebar with a space's custom theme and provides the theme editor.
++ *
++ * Spaces without a custom theme keep Arcify's named-color behaviour untouched: callers set the
++ * named color first and then call applySpaceTheme(), which only adds the custom paint on top.
++ */
++import {
++    computeThemeStyle, normalizeTheme, nearestNamedColor, DEFAULT_THEME,
++    THEME_PRESETS, MAX_THEME_COLORS, NAMED_COLORS
++} from './space-theme.js';
++import { loadSpaceThemes, saveSpaceTheme, renameSpaceTheme, onSpaceThemesChanged } from './space-theme-store.js';
++import { Logger } from './logger.js';
++
++let themes = {};
++let repaintActiveSpace = () => { };
++const darkQuery = typeof matchMedia === 'function' ? matchMedia('(prefers-color-scheme: dark)') : null;
++
++function systemDark() {
++    return !!darkQuery?.matches;
++}
++
++/**
++ * Load saved themes and keep them current.
++ * @param {() => void} repaint - re-applies the active space's colors (named color + theme)
++ */
++export async function initSpaceThemes(repaint) {
++    repaintActiveSpace = repaint;
++    try {
++        themes = await loadSpaceThemes();
++    } catch (error) {
++        Logger.error('[SpaceTheme] Could not load themes:', error);
++        themes = {};
++    }
++    onSpaceThemesChanged(updated => {
++        themes = updated;
++        repaintActiveSpace();
++    });
++    darkQuery?.addEventListener?.('change', () => repaintActiveSpace());
++}
++
++export function getSpaceTheme(spaceName) {
++    return themes[spaceName] || null;
++}
++
++export function forgetSpaceTheme(spaceName) {
++    if (!(spaceName in themes)) return Promise.resolve();
++    delete themes[spaceName];
++    return saveSpaceTheme(spaceName, null).catch(error => Logger.error('[SpaceTheme] Could not remove theme:', error));
++}
++
++export function handleSpaceRenamed(oldName, newName) {
++    if (oldName === newName || !(oldName in themes)) return Promise.resolve();
++    themes[newName] = themes[oldName];
++    delete themes[oldName];
++    return renameSpaceTheme(oldName, newName).catch(error => Logger.error('[SpaceTheme] Could not rename theme:', error));
++}
++
++const CUSTOM_PROPS = ['--custom-space-bg-color', '--custom-space-bg-image', '--custom-space-bg-size', '--custom-space-bg-repeat'];
++
++function clearCustomPaint(container) {
++    container.classList.remove('custom-space-theme');
++    CUSTOM_PROPS.forEach(p => container.style.removeProperty(p));
++    document.body.classList.remove('space-text-light', 'space-text-dark');
++}
++
++/**
++ * Apply the space's custom theme (or a draft while editing) on top of the named color.
++ * @param {object} space
++ * @param {object|null} [draft] - theme to preview instead of the saved one; null = no custom theme
++ */
++export function applySpaceTheme(space, draft) {
++    const container = document.getElementById('sidebar-container');
++    if (!container || !space) return;
++    const editing = openEditor && openEditor.spaceId === space.id ? openEditor.draft : undefined;
++    const theme = draft !== undefined ? draft : editing !== undefined ? editing : themes[space.name];
++    if (!theme) {
++        clearCustomPaint(container);
++        return;
++    }
++    const style = computeThemeStyle(theme, systemDark());
++    container.classList.add('custom-space-theme');
++    container.style.setProperty('--custom-space-bg-color', style.backgroundColor);
++    container.style.setProperty('--custom-space-bg-image', style.backgroundImage);
++    container.style.setProperty('--custom-space-bg-size', style.backgroundSize);
++    container.style.setProperty('--custom-space-bg-repeat', style.backgroundRepeat);
++    container.style.setProperty('--space-bg-color', style.spaceBg);
++    container.style.setProperty('--space-bg-color-dark', style.spaceBgDark);
++    document.body.classList.toggle('space-text-light', style.text === 'light');
++    document.body.classList.toggle('space-text-dark', style.text === 'dark');
++}
++
++/* ---------------------------------------------------------------- editor */
++
++let openEditor = null;
++
++function el(tag, attrs = {}, children = []) {
++    const node = document.createElement(tag);
++    for (const [k, v] of Object.entries(attrs)) {
++        if (k === 'class') node.className = v;
++        else if (k === 'text') node.textContent = v;
++        else if (k.startsWith('on')) node.addEventListener(k.slice(2), v);
++        else node.setAttribute(k, v);
++    }
++    for (const c of children) node.append(c);
++    return node;
++}
++
++/**
++ * Open the theme editor for a space.
++ * @param {object} space
++ * @param {(namedColor: string) => Promise<void>|void} onNamedColor - keep space.color (tab groups,
++ *        switcher) close to the custom color; the caller persists it.
++ */
++export function openSpaceThemeEditor(space, onNamedColor) {
++    if (openEditor) openEditor.close(true);
++
++    const saved = getSpaceTheme(space.name);
++    const startColor = NAMED_COLORS[space.color] || DEFAULT_THEME.colors[0];
++    const draft = normalizeTheme(saved) || { ...DEFAULT_THEME, colors: [startColor] };
++    let selected = 0;
++    let saveTimer = null;
++    let dirty = false;
++
++    const preview = () => applySpaceTheme(space, draft);
++
++    const persist = async () => {
++        clearTimeout(saveTimer);
++        saveTimer = null;
++        if (!dirty) return;
++        dirty = false;
++        const normalized = normalizeTheme(draft);
++        themes[space.name] = normalized;
++        try {
++            await saveSpaceTheme(space.name, normalized);
++            const named = nearestNamedColor(normalized.colors[0]);
++            if (named !== space.color) await onNamedColor?.(named);
++        } catch (error) {
++            Logger.error('[SpaceTheme] Could not save theme:', error);
++        }
++    };
++    // chrome.storage.sync limits writes per minute, so slider drags only preview; saves are debounced
++    const scheduleSave = () => {
++        dirty = true;
++        clearTimeout(saveTimer);
++        saveTimer = setTimeout(persist, 500);
++    };
++    const changed = (save = true) => {
++        preview();
++        render();
++        if (save) scheduleSave();
++    };
++
++    const modeRow = el('div', { class: 'stheme-modes', role: 'radiogroup', 'aria-label': 'Appearance' });
++    const slotRow = el('div', { class: 'stheme-slots' });
++    const presetRow = el('div', { class: 'stheme-presets' });
++    const intensity = el('input', { type: 'range', min: '0', max: '100', class: 'stheme-range', 'aria-label': 'Intensity' });
++    const grain = el('input', { type: 'range', min: '0', max: '100', class: 'stheme-range', 'aria-label': 'Grain' });
++
++    [['auto', '✦', 'Auto'], ['light', '☀', 'Light'], ['dark', '☾', 'Dark']].forEach(([mode, icon, label]) => {
++        modeRow.append(el('button', {
++            type: 'button', class: 'stheme-mode', 'data-mode': mode, role: 'radio', title: label,
++            onclick: () => { draft.mode = mode; changed(); }
++        }, [el('span', { class: 'stheme-mode-icon', text: icon }), el('span', { text: label })]));
++    });
++
++    THEME_PRESETS.forEach(hex => {
++        presetRow.append(el('button', {
++            type: 'button', class: 'stheme-preset', title: hex, style: `background:${hex}`,
++            onclick: () => { draft.colors[selected] = hex; changed(); }
++        }));
++    });
++
++    intensity.addEventListener('input', () => { draft.intensity = intensity.value / 100; changed(false); });
++    intensity.addEventListener('change', scheduleSave);
++    grain.addEventListener('input', () => { draft.grain = grain.value / 100; changed(false); });
++    grain.addEventListener('change', scheduleSave);
++
++    function markSelected() {
++        slotRow.querySelectorAll('.stheme-slot').forEach((slot, i) => slot.classList.toggle('selected', i === selected));
++        presetRow.querySelectorAll('.stheme-preset').forEach(b => b.classList.toggle('selected', b.title === draft.colors[selected]));
++    }
++
++    function render() {
++        modeRow.querySelectorAll('.stheme-mode').forEach(b => {
++            const on = b.dataset.mode === draft.mode;
++            b.classList.toggle('selected', on);
++            b.setAttribute('aria-checked', String(on));
++        });
++        slotRow.replaceChildren();
++        draft.colors.forEach((hex, i) => {
++            const input = el('input', { type: 'color', value: hex, 'aria-label': `Color ${i + 1}` });
++            input.addEventListener('input', () => {
++                draft.colors[i] = input.value;
++                selected = i;
++                input.parentElement.style.background = input.value;
++                preview();
++            });
++            input.addEventListener('change', () => { draft.colors[i] = input.value; changed(); });
++            const slot = el('div', { class: 'stheme-slot' + (i === selected ? ' selected' : '') }, [
++                el('label', { class: 'stheme-swatch', style: `background:${hex}`, title: 'Pick a color', onclick: () => { selected = i; markSelected(); } }, [input])
++            ]);
++            if (draft.colors.length > 1) {
++                slot.append(el('button', {
++                    type: 'button', class: 'stheme-remove', title: 'Remove color', 'aria-label': `Remove color ${i + 1}`,
++                    onclick: () => { draft.colors.splice(i, 1); selected = Math.min(selected, draft.colors.length - 1); changed(); }
++                }, ['×']));
++            }
++            slotRow.append(slot);
++        });
++        if (draft.colors.length < MAX_THEME_COLORS) {
++            slotRow.append(el('button', {
++                type: 'button', class: 'stheme-add', title: 'Add a color (gradient)', 'aria-label': 'Add color',
++                onclick: () => { draft.colors.push(draft.colors[draft.colors.length - 1]); selected = draft.colors.length - 1; changed(); }
++            }, ['+']));
++        }
++        markSelected();
++        intensity.value = Math.round(draft.intensity * 100);
++        grain.value = Math.round(draft.grain * 100);
++    }
++
++    const panel = el('div', { class: 'stheme-editor', role: 'dialog', 'aria-label': `Color for ${space.name}` }, [
++        el('div', { class: 'stheme-header' }, [
++            el('span', { class: 'stheme-title', text: `${space.name} color` }),
++            el('button', { type: 'button', class: 'stheme-close', title: 'Done', 'aria-label': 'Close', onclick: () => close() }, ['×'])
++        ]),
++        modeRow,
++        el('div', { class: 'stheme-label', text: 'Colors' }),
++        slotRow,
++        presetRow,
++        el('label', { class: 'stheme-label' }, ['Intensity', intensity]),
++        el('label', { class: 'stheme-label' }, ['Grain', grain]),
++        el('div', { class: 'stheme-footer' }, [
++            el('button', {
++                type: 'button', class: 'stheme-reset', title: 'Back to the plain named color',
++                onclick: async () => {
++                    clearTimeout(saveTimer);
++                    dirty = false;
++                    await forgetSpaceTheme(space.name);
++                    close(false);
++                    repaintActiveSpace();
++                }
++            }, ['Reset']),
++            el('button', { type: 'button', class: 'stheme-done', onclick: () => close() }, ['Done'])
++        ])
++    ]);
++
++    const onKey = e => { if (e.key === 'Escape') close(); };
++    document.addEventListener('keydown', onKey);
++
++    function close(save = true) {
++        if (openEditor?.panel !== panel) return;
++        document.removeEventListener('keydown', onKey);
++        panel.remove();
++        openEditor = null;
++        if (save) persist().then(() => repaintActiveSpace());
++    }
++
++    document.body.append(panel);
++    openEditor = { close, spaceId: space.id, draft, panel };
++    render();
++    preview();
++    return openEditor;
++}
+diff --git a/space-theme-store.js b/space-theme-store.js
+new file mode 100644
+index 0000000..5c43384
+--- /dev/null
++++ b/space-theme-store.js
+@@ -0,0 +1,64 @@
++/**
++ * Storage for per-space custom themes.
++ *
++ * Themes live in chrome.storage.sync under one key, mapped by space name, so they follow the
++ * user's Google account like the space bookmark folders do (space IDs differ per computer, names
++ * don't). Writes are serialized so quick successive edits can't overwrite each other.
++ */
++import { normalizeTheme } from './space-theme.js';
++
++export const SPACE_THEMES_KEY = 'spaceThemes';
++
++let writeChain = Promise.resolve();
++function serialize(op) {
++    const run = writeChain.then(op, op);
++    writeChain = run.then(() => { }, () => { });
++    return run;
++}
++
++function cleanMap(map) {
++    const out = {};
++    for (const [name, theme] of Object.entries(map || {})) {
++        const t = normalizeTheme(theme);
++        if (t) out[name] = t;
++    }
++    return out;
++}
++
++export async function loadSpaceThemes() {
++    const result = await chrome.storage.sync.get(SPACE_THEMES_KEY);
++    return cleanMap(result[SPACE_THEMES_KEY]);
++}
++
++/** Save a theme for a space, or remove it with theme = null (back to the named color). */
++export function saveSpaceTheme(spaceName, theme) {
++    return serialize(async () => {
++        const all = await loadSpaceThemes();
++        const t = theme ? normalizeTheme(theme) : null;
++        if (t) all[spaceName] = t;
++        else delete all[spaceName];
++        await chrome.storage.sync.set({ [SPACE_THEMES_KEY]: all });
++        return all;
++    });
++}
++
++/** Keep a space's theme when the space is renamed. */
++export function renameSpaceTheme(oldName, newName) {
++    return serialize(async () => {
++        const all = await loadSpaceThemes();
++        if (oldName === newName || !(oldName in all)) return all;
++        all[newName] = all[oldName];
++        delete all[oldName];
++        await chrome.storage.sync.set({ [SPACE_THEMES_KEY]: all });
++        return all;
++    });
++}
++
++/** Calls back with the full, cleaned map whenever themes change (also from other computers). */
++export function onSpaceThemesChanged(callback) {
++    const listener = (changes, area) => {
++        if (area === 'sync' && changes[SPACE_THEMES_KEY]) callback(cleanMap(changes[SPACE_THEMES_KEY].newValue));
++    };
++    chrome.storage.onChanged.addListener(listener);
++    return () => chrome.storage.onChanged.removeListener(listener);
++}
+diff --git a/space-theme.js b/space-theme.js
+new file mode 100644
+index 0000000..88e34f4
+--- /dev/null
++++ b/space-theme.js
+@@ -0,0 +1,179 @@
++/**
++ * Per-space custom themes, Arc/Zen style.
++ *
++ * A theme is { colors: ['#rrggbb', ...1-3], mode: 'auto'|'light'|'dark', intensity: 0..1, grain: 0..1 }.
++ *  - colors: one color, or a 2-3 stop gradient
++ *  - mode: 'light' paints on a light base with dark text, 'dark' on a dark base with light text,
++ *          'auto' uses the system appearance as base and picks the text color from the result
++ *  - intensity: how much of the chosen color versus the neutral base (1 = exact color)
++ *  - grain: strength of a noise texture layered over the color
++ *
++ * Everything here is pure (no DOM, no chrome.*) so it can be unit tested.
++ */
++
++export const MAX_THEME_COLORS = 3;
++export const THEME_MODES = ['auto', 'light', 'dark'];
++export const LIGHT_BASE = '#f7f7f8';
++export const DARK_BASE = '#1c1c1f';
++
++// Arcify's named colors (kept for Chrome tab-group sync and the space color field)
++export const NAMED_COLORS = {
++    grey: '#cccccc', blue: '#8bb3f3', red: '#ff9e97', yellow: '#ffe29f',
++    green: '#8bda99', pink: '#fbaad7', purple: '#d6a6ff', cyan: '#a5e2ea'
++};
++
++export const THEME_PRESETS = [
++    '#f4f0e1', '#e9bccb', '#e4c4e4', '#cd7880', '#e08a72', '#d9cc85', '#84e6b2', '#929bbb',
++    '#9ec9f0', '#a5e2ea', '#fbf8e8', '#bdbdbd', '#5b5b66', '#1b1d3a', '#1f3b2c', '#000000'
++];
++
++export const DEFAULT_THEME = Object.freeze({ colors: ['#929bbb'], mode: 'auto', intensity: 0.8, grain: 0 });
++
++const HEX = /^#[0-9a-f]{6}$/i;
++
++function clamp01(value, fallback) {
++    const n = Number(value);
++    if (!Number.isFinite(n)) return fallback;
++    return Math.min(1, Math.max(0, n));
++}
++
++export function normalizeHex(value) {
++    if (typeof value !== 'string') return null;
++    let v = value.trim().toLowerCase();
++    if (/^#[0-9a-f]{3}$/.test(v)) v = '#' + v.slice(1).split('').map(c => c + c).join('');
++    return HEX.test(v) ? v : null;
++}
++
++/** Returns a valid theme, or null if the input can't be a theme at all. */
++export function normalizeTheme(theme) {
++    if (!theme || typeof theme !== 'object') return null;
++    const colors = (Array.isArray(theme.colors) ? theme.colors : [])
++        .map(normalizeHex).filter(Boolean).slice(0, MAX_THEME_COLORS);
++    if (colors.length === 0) return null;
++    return {
++        colors,
++        mode: THEME_MODES.includes(theme.mode) ? theme.mode : DEFAULT_THEME.mode,
++        intensity: clamp01(theme.intensity, DEFAULT_THEME.intensity),
++        grain: clamp01(theme.grain, DEFAULT_THEME.grain)
++    };
++}
++
++export function hexToRgb(hex) {
++    const h = normalizeHex(hex);
++    if (!h) return null;
++    return [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
++}
++
++export function rgbToHex(rgb) {
++    return '#' + rgb.map(v => Math.round(Math.min(255, Math.max(0, v))).toString(16).padStart(2, '0')).join('');
++}
++
++/** weight = share of `a` in the result (1 => a, 0 => b) */
++export function mixHex(a, b, weight) {
++    const ra = hexToRgb(a), rb = hexToRgb(b);
++    return rgbToHex(ra.map((v, i) => v * weight + rb[i] * (1 - weight)));
++}
++
++/** WCAG relative luminance, 0 (black) .. 1 (white) */
++export function relativeLuminance(hex) {
++    const [r, g, b] = hexToRgb(hex).map(v => {
++        const c = v / 255;
++        return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
++    });
++    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
++}
++
++function contrast(l1, l2) {
++    const [hi, lo] = l1 > l2 ? [l1, l2] : [l2, l1];
++    return (hi + 0.05) / (lo + 0.05);
++}
++
++const LIGHT_TEXT_LUM = relativeLuminance('#eceff1');
++const DARK_TEXT_LUM = relativeLuminance('#222222');
++
++/**
++ * 'light' text or 'dark' text, whichever reads better across all background colors
++ * (judged on the worst stop, so a gradient never gets text that vanishes at one end).
++ */
++export function pickTextMode(backgrounds) {
++    const lums = backgrounds.map(relativeLuminance);
++    const worst = textLum => Math.min(...lums.map(l => contrast(l, textLum)));
++    return worst(LIGHT_TEXT_LUM) >= worst(DARK_TEXT_LUM) ? 'light' : 'dark';
++}
++
++export function grainDataUri(grain) {
++    const opacity = (0.35 * grain).toFixed(3);
++    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'>` +
++        `<filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/>` +
++        `<feColorMatrix type='saturate' values='0'/></filter>` +
++        `<rect width='100%' height='100%' filter='url(#n)' opacity='${opacity}'/></svg>`;
++    return `url("data:image/svg+xml,${encodeURIComponent(svg)}")`;
++}
++
++/**
++ * Turns a theme into what the sidebar needs to paint.
++ * @param {object} theme
++ * @param {boolean} systemDark - whether the OS/browser is in dark mode (used by 'auto')
++ */
++export function computeThemeStyle(theme, systemDark = false) {
++    const t = normalizeTheme(theme) || DEFAULT_THEME;
++    const base = t.mode === 'light' ? LIGHT_BASE : t.mode === 'dark' ? DARK_BASE : (systemDark ? DARK_BASE : LIGHT_BASE);
++    const painted = t.colors.map(c => mixHex(c, base, t.intensity));
++    const text = t.mode === 'light' ? 'dark' : t.mode === 'dark' ? 'light' : pickTextMode(painted);
++
++    const layers = [];
++    const sizes = [];
++    const repeats = [];
++    if (t.grain > 0) {
++        layers.push(grainDataUri(t.grain));
++        sizes.push('160px 160px');
++        repeats.push('repeat');
++    }
++    layers.push(painted.length === 1
++        ? `linear-gradient(${painted[0]}, ${painted[0]})`
++        : `linear-gradient(165deg, ${painted.join(', ')})`);
++    sizes.push('100% 100%');
++    repeats.push('no-repeat');
++
++    // A single flat color behaves exactly like Arcify's named colors (tabs and folders use it as
++    // their own background). With a gradient or grain they become see-through so the paint shows.
++    const flat = painted.length === 1 && t.grain === 0;
++    const hoverOverlay = text === 'light' ? 'rgba(255, 255, 255, 0.10)' : 'rgba(0, 0, 0, 0.08)';
++    return {
++        painted,
++        text,
++        backgroundColor: painted[0],
++        backgroundImage: layers.join(', '),
++        backgroundSize: sizes.join(', '),
++        backgroundRepeat: repeats.join(', '),
++        spaceBg: flat ? painted[0] : 'transparent',
++        spaceBgDark: flat ? mixHex(painted[0], text === 'light' ? '#ffffff' : '#000000', 0.88) : hoverOverlay
++    };
++}
++
++function hsl(hex) {
++    const [r, g, b] = hexToRgb(hex).map(v => v / 255);
++    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
++    const l = (max + min) / 2;
++    if (d === 0) return { h: 0, s: 0, l };
++    const s = d / (1 - Math.abs(2 * l - 1));
++    let h;
++    if (max === r) h = ((g - b) / d) % 6;
++    else if (max === g) h = (b - r) / d + 2;
++    else h = (r - g) / d + 4;
++    return { h: (h * 60 + 360) % 360, s, l };
++}
++
++/** Closest Arcify named color by hue, used for Chrome tab groups and the color field. */
++export function nearestNamedColor(hex) {
++    if (!hexToRgb(hex)) return 'grey';
++    const { h, s } = hsl(hex);
++    if (s < 0.15) return 'grey';
++    if (h < 20 || h >= 345) return 'red';
++    if (h < 70) return 'yellow';
++    if (h < 165) return 'green';
++    if (h < 195) return 'cyan';
++    if (h < 255) return 'blue';
++    if (h < 300) return 'purple';
++    return 'pink';
++}
+diff --git a/styles.css b/styles.css
+index 4019615..55a55a4 100644
+--- a/styles.css
++++ b/styles.css
+@@ -2083,3 +2083,236 @@ h3 {
+ }
+ .tab-group-import p { margin: 0 0 8px; }
+ .tab-group-import button { margin-right: 8px; padding: 6px 10px; cursor: pointer; }
++
++/* ===================== Per-space custom themes (space-appearance.js) ===================== */
++
++.sidebar-container.custom-space-theme {
++    background-color: var(--custom-space-bg-color);
++    background-image: var(--custom-space-bg-image);
++    background-size: var(--custom-space-bg-size, 100% 100%);
++    background-repeat: var(--custom-space-bg-repeat, no-repeat);
++}
++
++/* Text color follows the theme's light/dark choice, not just the system setting */
++body.space-text-light,
++body.space-text-light h3,
++body.space-text-light .space-name,
++body.space-text-light .space-toggle-chevron,
++body.space-text-light .folder-name,
++body.space-text-light .new-tab-btn,
++body.space-text-light .add-space-toggle {
++    color: #eceff1;
++}
++body.space-text-light .space-options,
++body.space-text-light .clean-tabs-btn,
++body.space-text-light .sidebar-button,
++body.space-text-light .add-space-btn,
++body.space-text-light .tab-placeholder,
++body.space-text-light .pinned-tab-placeholder,
++body.space-text-light .tab-restore,
++body.space-text-light .tab-remove,
++body.space-text-light .placeholder-close-btn,
++body.space-text-light .tab.bookmark-only .tab-title-display {
++    color: rgba(236, 239, 241, 0.7);
++}
++body.space-text-dark,
++body.space-text-dark h3,
++body.space-text-dark .space-name,
++body.space-text-dark .space-toggle-chevron,
++body.space-text-dark .folder-name,
++body.space-text-dark .new-tab-btn,
++body.space-text-dark .add-space-toggle {
++    color: #222;
++}
++body.space-text-dark .space-options,
++body.space-text-dark .clean-tabs-btn,
++body.space-text-dark .sidebar-button,
++body.space-text-dark .add-space-btn,
++body.space-text-dark .tab-placeholder,
++body.space-text-dark .pinned-tab-placeholder,
++body.space-text-dark .tab-restore,
++body.space-text-dark .tab-remove,
++body.space-text-dark .placeholder-close-btn,
++body.space-text-dark .tab.bookmark-only .tab-title-display {
++    color: rgba(16, 16, 16, 0.65);
++}
++
++/* Editor panel */
++.stheme-editor {
++    --stheme-bg: rgba(250, 250, 252, 0.97);
++    --stheme-fg: #222;
++    --stheme-muted: rgba(0, 0, 0, 0.55);
++    --stheme-line: rgba(0, 0, 0, 0.1);
++    --stheme-chip: rgba(0, 0, 0, 0.06);
++    --stheme-accent: #5b6ee1;
++    position: fixed;
++    left: 8px;
++    right: 8px;
++    bottom: 8px;
++    z-index: 10000;
++    max-height: calc(100vh - 16px);
++    overflow-y: auto;
++    padding: 12px;
++    border-radius: 14px;
++    background: var(--stheme-bg);
++    color: var(--stheme-fg);
++    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3), 0 0 0 1px var(--stheme-line);
++    backdrop-filter: blur(12px);
++    display: flex;
++    flex-direction: column;
++    gap: 10px;
++    font-size: 12px;
++}
++@media (prefers-color-scheme: dark) {
++    .stheme-editor {
++        --stheme-bg: rgba(40, 40, 46, 0.97);
++        --stheme-fg: #eceff1;
++        --stheme-muted: rgba(255, 255, 255, 0.6);
++        --stheme-line: rgba(255, 255, 255, 0.12);
++        --stheme-chip: rgba(255, 255, 255, 0.08);
++        --stheme-accent: #9aa8ff;
++    }
++}
++.stheme-editor button {
++    font: inherit;
++    color: inherit;
++    border: none;
++    cursor: pointer;
++}
++.stheme-header {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++}
++.stheme-title {
++    font-weight: 600;
++    font-size: 13px;
++    overflow: hidden;
++    text-overflow: ellipsis;
++    white-space: nowrap;
++}
++.stheme-close {
++    background: transparent;
++    font-size: 18px;
++    line-height: 1;
++    width: 26px;
++    height: 26px;
++    border-radius: 8px;
++}
++.stheme-close:hover { background: var(--stheme-chip); }
++.stheme-modes {
++    display: grid;
++    grid-template-columns: repeat(3, 1fr);
++    gap: 4px;
++    padding: 3px;
++    border-radius: 10px;
++    background: var(--stheme-chip);
++}
++.stheme-mode {
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    gap: 5px;
++    padding: 6px 4px;
++    border-radius: 8px;
++    background: transparent;
++}
++.stheme-mode.selected {
++    background: var(--stheme-bg);
++    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
++}
++.stheme-mode-icon { font-size: 13px; }
++.stheme-label {
++    display: flex;
++    flex-direction: column;
++    gap: 4px;
++    color: var(--stheme-muted);
++    font-weight: 600;
++}
++.stheme-slots {
++    display: flex;
++    align-items: center;
++    gap: 10px;
++    flex-wrap: wrap;
++}
++.stheme-slot {
++    position: relative;
++    padding: 3px;
++    border-radius: 50%;
++    border: 2px solid transparent;
++}
++.stheme-slot.selected { border-color: var(--stheme-accent); }
++.stheme-swatch {
++    display: block;
++    width: 34px;
++    height: 34px;
++    border-radius: 50%;
++    cursor: pointer;
++    box-shadow: inset 0 0 0 1px var(--stheme-line);
++    overflow: hidden;
++}
++.stheme-swatch input[type="color"] {
++    opacity: 0;
++    width: 100%;
++    height: 100%;
++    border: none;
++    padding: 0;
++    cursor: pointer;
++}
++.stheme-remove {
++    position: absolute;
++    top: -6px;
++    right: -6px;
++    width: 18px;
++    height: 18px;
++    border-radius: 50%;
++    background: var(--stheme-bg) !important;
++    box-shadow: 0 0 0 1px var(--stheme-line);
++    font-size: 12px;
++    line-height: 18px;
++    padding: 0;
++}
++.stheme-add {
++    width: 34px;
++    height: 34px;
++    border-radius: 50%;
++    background: var(--stheme-chip);
++    font-size: 18px;
++    line-height: 1;
++}
++.stheme-add:hover, .stheme-remove:hover { background: var(--stheme-line); }
++.stheme-presets {
++    display: grid;
++    grid-template-columns: repeat(8, 1fr);
++    gap: 6px;
++}
++.stheme-preset {
++    aspect-ratio: 1;
++    width: 100%;
++    border-radius: 50%;
++    box-shadow: inset 0 0 0 1px var(--stheme-line);
++    padding: 0;
++}
++.stheme-preset.selected { box-shadow: 0 0 0 2px var(--stheme-accent); }
++.stheme-range {
++    width: 100%;
++    accent-color: var(--stheme-accent);
++}
++.stheme-footer {
++    display: flex;
++    justify-content: space-between;
++    gap: 8px;
++}
++.stheme-reset, .stheme-done {
++    padding: 7px 14px;
++    border-radius: 9px;
++    background: var(--stheme-chip);
++    font-weight: 600;
++}
++.stheme-done {
++    background: var(--stheme-accent);
++    color: #fff !important;
++}
++@media (prefers-color-scheme: dark) {
++    .stheme-done { color: #1b1d3a !important; }
++}
+diff --git a/tab-group-sync.js b/tab-group-sync.js
+index b17f7e5..600b413 100644
+--- a/tab-group-sync.js
++++ b/tab-group-sync.js
+@@ -3,7 +3,7 @@
+ export async function syncSpaceGroups(spaces, activeSpaces = {}) {
+     const { syncTabGroups = false } = await chrome.storage.sync.get('syncTabGroups');
+     if (!syncTabGroups) return;
+-    const { spaceGroupProjection = {} } = await chrome.storage.session.get('spaceGroupProjection');
++    const { spaceGroupProjection = {}, spaceGroupActive = {} } = await chrome.storage.session.get(['spaceGroupProjection', 'spaceGroupActive']);
+     const groups = await chrome.tabGroups.query({});
+     const tabs = await chrome.tabs.query({});
+     const byId = new Map(tabs.map(t => [t.id, t]));
+@@ -25,8 +25,9 @@ export async function syncSpaceGroups(spaces, activeSpaces = {}) {
+             }
+             next[key] = groupId;
+             const collapsed = Boolean(activeSpaces[windowId] && activeSpaces[windowId] !== space.id);
+-            if (!liveGroup || liveGroup.title !== space.name || liveGroup.color !== space.color || liveGroup.collapsed !== collapsed) {
+-                await chrome.tabGroups.update(groupId, { title: space.name, color: space.color, collapsed });
++            const setCollapsed = !liveGroup || (activeSpaces[windowId] ?? null) !== (spaceGroupActive[windowId] ?? null);
++            if (!liveGroup || liveGroup.title !== space.name || liveGroup.color !== space.color || (setCollapsed && liveGroup.collapsed !== collapsed)) {
++                await chrome.tabGroups.update(groupId, { title: space.name, color: space.color, ...(setCollapsed ? { collapsed } : {}) });
+             }
+             const current = await chrome.tabs.query({ groupId });
+             current.sort((a, b) => a.index - b.index);
+@@ -35,5 +36,5 @@ export async function syncSpaceGroups(spaces, activeSpaces = {}) {
+             }
+         }
+     }
+-    await chrome.storage.session.set({ spaceGroupProjection: next });
++    await chrome.storage.session.set({ spaceGroupProjection: next, spaceGroupActive: { ...activeSpaces } });
+ }
+diff --git a/tests/unit/space-store.test.js b/tests/unit/space-store.test.js
+index c067563..d92ebb3 100644
+--- a/tests/unit/space-store.test.js
++++ b/tests/unit/space-store.test.js
+@@ -80,6 +80,21 @@ test('sync is opt-in and disabling it performs no mutations', async () => {
+     mutations.length = 0; sync.syncTabGroups = false;
+     await syncSpaceGroups(local.spaces); assert.deepEqual(mutations, []);
+ });
++test('groups opened in Chrome stay open until the active space changes', async () => {
++    sync.syncTabGroups = true;
++    await syncSpaceGroups(local.spaces, { 1: 'a' });
++    const groupOf = id => groups.find(g => g.id === session.spaceGroupProjection[`${id}:1`]);
++    assert.equal(groupOf('a').collapsed, false);
++    assert.equal(groupOf('b').collapsed, true);
++    groupOf('b').collapsed = false; // the user expands space b's group in the tab strip
++    mutations.length = 0;
++    await syncSpaceGroups(local.spaces, { 1: 'a' });
++    assert.equal(groupOf('b').collapsed, false);
++    assert.deepEqual(mutations, []);
++    await syncSpaceGroups(local.spaces, { 1: 'b' }); // switching spaces tidies up again
++    assert.equal(groupOf('a').collapsed, true);
++    assert.equal(groupOf('b').collapsed, false);
++});
+ test('sync creates each group in its tabs original window', async () => {
+     tabs[1].windowId = 2;
+     sync.syncTabGroups = true;
+diff --git a/tests/unit/space-theme-store.test.js b/tests/unit/space-theme-store.test.js
+new file mode 100644
+index 0000000..e064254
+--- /dev/null
++++ b/tests/unit/space-theme-store.test.js
+@@ -0,0 +1,65 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++
++function installChrome() {
++    const data = {};
++    const listeners = [];
++    globalThis.chrome = {
++        storage: {
++            sync: {
++                get: async key => (key in data ? { [key]: structuredClone(data[key]) } : {}),
++                set: async obj => {
++                    const changes = {};
++                    for (const [k, v] of Object.entries(obj)) {
++                        changes[k] = { oldValue: data[k], newValue: structuredClone(v) };
++                        data[k] = structuredClone(v);
++                    }
++                    listeners.forEach(l => l(changes, 'sync'));
++                }
++            },
++            onChanged: { addListener: l => listeners.push(l), removeListener: l => listeners.splice(listeners.indexOf(l), 1) }
++        }
++    };
++    return data;
++}
++
++const store = await import('../../space-theme-store.js');
++
++test('themes are saved per space name in chrome.storage.sync', async () => {
++    const data = installChrome();
++    await store.saveSpaceTheme('Work', { colors: ['#1b1d3a'], mode: 'dark', intensity: 1, grain: 0.2 });
++    assert.deepEqual(data.spaceThemes, { Work: { colors: ['#1b1d3a'], mode: 'dark', intensity: 1, grain: 0.2 } });
++    assert.deepEqual(Object.keys(await store.loadSpaceThemes()), ['Work']);
++});
++
++test('saving null removes the theme; invalid themes are not stored', async () => {
++    const data = installChrome();
++    await store.saveSpaceTheme('Home', { colors: ['#fbf8e8'] });
++    await store.saveSpaceTheme('Home', null);
++    await store.saveSpaceTheme('bad', { colors: [] });
++    assert.deepEqual(data.spaceThemes, {});
++});
++
++test('rapid edits are serialized and none are lost', async () => {
++    const data = installChrome();
++    await Promise.all(['a', 'b', 'c', 'd'].map(n => store.saveSpaceTheme(n, { colors: ['#000000'] })));
++    assert.deepEqual(Object.keys(data.spaceThemes).sort(), ['a', 'b', 'c', 'd']);
++});
++
++test('renaming a space keeps its theme', async () => {
++    const data = installChrome();
++    await store.saveSpaceTheme('Projects', { colors: ['#3ddc97'] });
++    await store.renameSpaceTheme('Projects', 'Work');
++    assert.deepEqual(Object.keys(data.spaceThemes), ['Work']);
++});
++
++test('change listener receives cleaned themes from sync', async () => {
++    installChrome();
++    const seen = [];
++    const off = store.onSpaceThemesChanged(map => seen.push(map));
++    await store.saveSpaceTheme('Reading', { colors: ['#000000'], grain: 0.5 });
++    off();
++    await store.saveSpaceTheme('Other', { colors: ['#000000'] });
++    assert.equal(seen.length, 1);
++    assert.equal(seen[0].Reading.grain, 0.5);
++});
+diff --git a/tests/unit/space-theme.test.js b/tests/unit/space-theme.test.js
+new file mode 100644
+index 0000000..9919365
+--- /dev/null
++++ b/tests/unit/space-theme.test.js
+@@ -0,0 +1,67 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {
++    normalizeTheme, computeThemeStyle, nearestNamedColor, mixHex, pickTextMode,
++    relativeLuminance, MAX_THEME_COLORS, DEFAULT_THEME
++} from '../../space-theme.js';
++
++test('normalizeTheme keeps valid fields, fixes the rest, rejects themes without colors', () => {
++    assert.deepEqual(normalizeTheme({ colors: ['#ABCDEF', '#123'], mode: 'dark', intensity: 2, grain: -1 }),
++        { colors: ['#abcdef', '#112233'], mode: 'dark', intensity: 1, grain: 0 });
++    assert.equal(normalizeTheme({ colors: ['nope'] }), null);
++    assert.equal(normalizeTheme(null), null);
++    const t = normalizeTheme({ colors: ['#111111', '#222222', '#333333', '#444444'], mode: 'weird' });
++    assert.equal(t.colors.length, MAX_THEME_COLORS);
++    assert.equal(t.mode, DEFAULT_THEME.mode);
++    assert.equal(t.intensity, DEFAULT_THEME.intensity);
++});
++
++test('full intensity paints the exact color', () => {
++    const s = computeThemeStyle({ colors: ['#1b1d3a'], mode: 'auto', intensity: 1, grain: 0 }, false);
++    assert.equal(s.backgroundColor, '#1b1d3a');
++    assert.equal(s.spaceBg, '#1b1d3a');
++    assert.equal(s.text, 'light'); // dark purple needs light text
++});
++
++test('intensity blends toward the light or dark base', () => {
++    const light = computeThemeStyle({ colors: ['#ff0000'], mode: 'light', intensity: 0.5, grain: 0 });
++    const dark = computeThemeStyle({ colors: ['#ff0000'], mode: 'dark', intensity: 0.5, grain: 0 });
++    assert.ok(relativeLuminance(light.backgroundColor) > relativeLuminance(dark.backgroundColor));
++    assert.equal(light.text, 'dark');
++    assert.equal(dark.text, 'light');
++    assert.equal(mixHex('#ff0000', '#000000', 0), '#000000');
++});
++
++test('auto mode follows the system base and picks readable text', () => {
++    const t = { colors: ['#929bbb'], mode: 'auto', intensity: 0.3, grain: 0 };
++    assert.equal(computeThemeStyle(t, false).text, 'dark');
++    assert.equal(computeThemeStyle(t, true).text, 'light');
++    assert.equal(pickTextMode(['#fbf8e8']), 'dark');
++    assert.equal(pickTextMode(['#000000']), 'light');
++    // a gradient from pale to mid-dark is judged on its worst stop
++    assert.equal(pickTextMode(['#fbf8e8', '#5b5b66']), 'dark');
++    assert.equal(pickTextMode(['#1b1d3a', '#929bbb']), 'light');
++});
++
++test('gradients and grain make tab/folder backgrounds see-through', () => {
++    const g = computeThemeStyle({ colors: ['#3ddc97', '#1b1d3a'], mode: 'auto', intensity: 1, grain: 0 });
++    assert.equal(g.backgroundImage, 'linear-gradient(165deg, #3ddc97, #1b1d3a)');
++    assert.equal(g.backgroundSize, '100% 100%');
++    assert.equal(g.spaceBg, 'transparent');
++    const n = computeThemeStyle({ colors: ['#3ddc97'], mode: 'auto', intensity: 1, grain: 0.5 });
++    assert.match(n.backgroundImage, /^url\("data:image\/svg\+xml,.*"\), linear-gradient/);
++    assert.equal(n.backgroundSize, '160px 160px, 100% 100%');
++    assert.equal(n.backgroundRepeat, 'repeat, no-repeat');
++    assert.equal(n.spaceBg, 'transparent');
++});
++
++test('nearestNamedColor maps by hue for tab-group sync', () => {
++    assert.equal(nearestNamedColor('#000000'), 'grey');
++    assert.equal(nearestNamedColor('#fbf8e8'), 'yellow');
++    assert.equal(nearestNamedColor('#3ddc97'), 'green');
++    assert.equal(nearestNamedColor('#1b1d3a'), 'blue');
++    assert.equal(nearestNamedColor('#e9bccb'), 'pink');
++    assert.equal(nearestNamedColor('#a020f0'), 'purple');
++    assert.equal(nearestNamedColor('#ff2222'), 'red');
++    assert.equal(nearestNamedColor('bad'), 'grey');
++});
+diff --git a/tests/unit/tab-context-menu.test.js b/tests/unit/tab-context-menu.test.js
+new file mode 100644
+index 0000000..4814b84
+--- /dev/null
++++ b/tests/unit/tab-context-menu.test.js
+@@ -0,0 +1,38 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { parseHTML } from 'linkedom';
++
++const { window, document } = parseHTML('<html><body><div class="tab"><div class="tab-details"><span class="tab-title-display">Title</span></div></div></body></html>');
++globalThis.window = window;
++globalThis.document = document;
++globalThis.MouseEvent = window.MouseEvent || window.Event;
++// no layout engine here: give elements a size so the menu can be positioned
++window.HTMLElement.prototype.getBoundingClientRect = () => ({ top: 0, left: 0, right: 160, bottom: 200, width: 160, height: 200 });
++window.innerWidth = 1024;
++window.innerHeight = 768;
++globalThis.chrome = { storage: { local: { get: async () => ({}), set: async () => { } }, sync: { get: async () => ({}) }, onChanged: { addListener() { } } } };
++
++const { showTabContextMenu } = await import('../../domManager.js');
++
++function openMenu(isBookmarkOnly = false) {
++    const tabElement = document.querySelector('.tab');
++    showTabContextMenu(10, 10, { id: 1, url: 'https://example.test/' }, false, isBookmarkOnly, tabElement,
++        () => { }, [], () => { }, () => { }, [], () => { });
++    return [...document.querySelectorAll('.context-menu-item')];
++}
++
++test('the tab menu offers Rename Tab, which starts the inline rename', async () => {
++    let renameStarted = false;
++    document.querySelector('.tab-details').addEventListener('dblclick', () => { renameStarted = true; });
++    const rename = openMenu().find(item => item.textContent === 'Rename Tab');
++    assert.ok(rename, 'Rename Tab is in the menu');
++    rename.dispatchEvent(new window.Event('click'));
++    await new Promise(resolve => setTimeout(resolve, 5));
++    assert.equal(renameStarted, true);
++    assert.equal(document.querySelectorAll('.context-menu-item').length, 0, 'menu closed');
++});
++
++test('saved favorites that are not open have nothing to rename', () => {
++    document.querySelectorAll('.context-menu').forEach(menu => menu.remove());
++    assert.ok(!openMenu(true).some(item => item.textContent === 'Rename Tab'));
++});

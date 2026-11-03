@@ -1,0 +1,6 @@
+[submodule "vendor/arcify"]
+	path = vendor/arcify
+	url = https://github.com/nisargkolhe/arcify.git
+[submodule "vendor/arcify-spotlight"]
+	path = vendor/arcify-spotlight
+	url = https://github.com/phulsechinmay/arcify-spotlight.git
